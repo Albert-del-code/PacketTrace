@@ -20,7 +20,7 @@ namespace PacketTrace
         TcpFlows flows = new TcpFlows();
         TcpFlow flowFilter;
         Session session;
-        int number, dropped, evicted, retainedBytes;
+        int number, dropped, retainedBytes;
         bool changingRows, demoRunning;
         Packet selected;
 
@@ -28,7 +28,7 @@ namespace PacketTrace
         {
             public readonly CancellationTokenSource Stop = new CancellationTokenSource();
             public readonly ConcurrentQueue<Packet> Queue = new ConcurrentQueue<Packet>();
-            public bool Live, Loopback;
+            public bool Live, Loopback, LimitReached;
             public volatile bool Ready, Done;
             public volatile string Error;
             public int Waiting, WaitingBytes, Dropped;
@@ -218,7 +218,7 @@ namespace PacketTrace
                 Drain();
                 for (int attempt = 0; session == state && !HasDemoResults(port) && attempt < 20; attempt++)
                     await Task.Delay(80);
-                if (session == state)
+                if (session == state && !state.Stop.IsCancellationRequested)
                     message.Text = HasDemoResults(port)
                         ? "演示端口 " + port + "  ·  点选不同连接中的包，查看 200、404 和连接被拒绝。"
                         : "网页访问已执行，但抓包结果不完整。请重试本机网页演示。";
@@ -254,41 +254,45 @@ namespace PacketTrace
             }
             string protocol = (string)protocols.SelectedItem;
             string term = search.Text.Trim();
+            int previousCount = visible.Count;
+            TcpFlow selectedFlow = selected == null ? null : selected.Flow;
+            bool flowChanged = false;
             int count = 0;
             Packet packet;
             while (count < 480 && state.Queue.TryDequeue(out packet))
             {
+                count++;
                 Interlocked.Decrement(ref state.Waiting);
                 Interlocked.Add(ref state.WaitingBytes, -packet.CapturedLength);
+                if (state.LimitReached) continue;
+                if (all.Count >= History || retainedBytes + packet.CapturedLength > HistoryBytes)
+                {
+                    // 达到上限后保留原有数据，避免后台流量挤掉正在查看的连接。
+                    state.LimitReached = true;
+                    state.Stop.Cancel();
+                    message.Text = "已达到容量上限，正在停止。已抓到的数据会保留。";
+                    SetStatus("正在停止", Color.FromArgb(83, 100, 124));
+                    Buttons();
+                    continue;
+                }
                 packet.Number = ++number;
                 flows.Add(packet);
                 all.Add(packet);
                 retainedBytes += packet.CapturedLength;
                 if (MatchesDisplay(packet, protocol, term)) visible.Add(packet);
-                count++;
+                if (selectedFlow != null && packet.Flow == selectedFlow) flowChanged = true;
             }
             dropped = state.Dropped;
-            if (all.Count > History || retainedBytes > HistoryBytes)
-            {
-                int remove = 0;
-                while (all.Count - remove > History || retainedBytes > HistoryBytes)
-                    retainedBytes -= all[remove++].CapturedLength;
-                all.RemoveRange(0, remove);
-                evicted += remove;
-                flows.Prune(all[0].Number);
-                if (flowFilter != null && flowFilter.LastPacket < all[0].Number) flowFilter = null;
-                Refilter();
-            }
-            else if (count > 0)
-            {
-                UpdateRows();
-                if (tabs.SelectedTab == flowTab) UpdateDetails();
-            }
+            if (visible.Count != previousCount) UpdateRows(false);
+            if (flowChanged && tabs.SelectedTab == flowTab) UpdateDetails();
             if (state.Done && state.Queue.IsEmpty)
             {
                 message.Text = state.Error != null ? "读取失败：" + state.Error :
+                    state.LimitReached ? "已达到容量上限（3000 个包或 32 MB），已停止" + (state.Live ? "抓包" : "读取文件") +
+                        "。已保留的数据可继续查看和保存。" :
                     state.Stop.IsCancellationRequested ? "已停止。可以继续查看已捕获的数据包。" : "已打开抓包文件。双击 TCP 包可查看连接。";
                 if (state.Error != null) SetStatus("读取失败", Theme.Red);
+                else if (state.LimitReached) SetStatus("已达上限", Theme.Amber);
                 else if (state.Stop.IsCancellationRequested) SetStatus("已停止", Color.FromArgb(62, 82, 109));
                 else SetStatus("离线分析", Theme.Blue);
                 state.Stop.Dispose();
@@ -314,7 +318,7 @@ namespace PacketTrace
             visible.Clear();
             flows = new TcpFlows();
             flowFilter = null;
-            number = evicted = retainedBytes = 0;
+            number = retainedBytes = 0;
             if (session == null) dropped = 0;
             selected = null;
             UpdateRows();
@@ -364,7 +368,7 @@ namespace PacketTrace
             UpdateFilterControls();
         }
 
-        void UpdateRows()
+        void UpdateRows(bool refresh = true)
         {
             changingRows = true;
             try
@@ -374,7 +378,7 @@ namespace PacketTrace
                 if (target < 0 && visible.Count > 0) target = 0;
                 if (target >= 0 && (packets.CurrentCell == null || packets.CurrentCell.RowIndex != target))
                     packets.CurrentCell = packets.Rows[target].Cells[0];
-                packets.Invalidate();
+                if (refresh) packets.Invalidate();
             }
             finally { changingRows = false; }
             SelectPacket();
@@ -398,12 +402,21 @@ namespace PacketTrace
                 return;
             }
             TcpFlow flow = selected == null ? null : selected.Flow;
-            flowRows.Clear();
+            var updatedRows = new List<Packet>();
             if (flow != null)
                 foreach (Packet p in all)
-                    if (p.Flow == flow) flowRows.Add(p);
-            if (timeline.RowCount != flowRows.Count) timeline.RowCount = flowRows.Count;
-            timeline.Invalidate();
+                    if (p.Flow == flow) updatedRows.Add(p);
+            bool changed = updatedRows.Count != flowRows.Count;
+            if (!changed)
+                for (int i = 0; i < updatedRows.Count; i++)
+                    if (updatedRows[i] != flowRows[i]) { changed = true; break; }
+            if (changed)
+            {
+                flowRows.Clear();
+                flowRows.AddRange(updatedRows);
+                if (timeline.RowCount != flowRows.Count) timeline.RowCount = flowRows.Count;
+                timeline.Invalidate();
+            }
             isolate.Text = flowFilter != null ? "退出连接筛选" : "仅看本连接";
             isolate.Enabled = flowRows.Count != 0 || flowFilter != null;
             if (flowRows.Count == 0)
@@ -424,7 +437,7 @@ namespace PacketTrace
         void Counts()
         {
             counters.Text = "显示 " + visible.Count + " / 保留 " + all.Count +
-                (evicted > 0 ? "  ·  已移出 " + evicted : "") + (dropped > 0 ? "  ·  未处理 " + dropped : "");
+                (dropped > 0 ? "  ·  未处理 " + dropped : "");
             clear.Enabled = all.Count > 0;
             save.Enabled = session == null && all.Count > 0;
         }

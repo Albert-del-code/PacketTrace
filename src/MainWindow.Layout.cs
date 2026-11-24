@@ -363,7 +363,7 @@ namespace PacketTrace
 
         static DataGridView Grid(string name)
         {
-            var g = new DataGridView
+            var g = new BufferedPacketGrid
             {
                 AccessibleName = name, VirtualMode = true, Dock = DockStyle.Fill, Margin = Padding.Empty,
                 BackgroundColor = Color.White, BorderStyle = BorderStyle.None, ReadOnly = true, RowHeadersVisible = false,
@@ -383,6 +383,14 @@ namespace PacketTrace
                 WrapMode = DataGridViewTriState.False };
             g.AlternatingRowsDefaultCellStyle.BackColor = Theme.Pale;
             return g;
+        }
+
+        sealed class BufferedPacketGrid : DataGridView
+        {
+            public BufferedPacketGrid()
+            {
+                DoubleBuffered = true;
+            }
         }
 
         static void AddColumn(DataGridView grid, string title, int width, bool fill = false, bool mono = false, bool numeric = false)
